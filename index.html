@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Within Reach</title>
+<!--
+  Within Reach: a seated, hands-only WebXR game that fits itself to each player.
+  It learns your reach, which hands you use and how steady you are, then builds every challenge inside that space.
+  Open in the Meta Quest browser over HTTPS. Everything runs on the headset; nothing is uploaded.
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #070b1f; color: #fff; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { display: block; }
+  #landing { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 24px; gap: 14px; z-index: 5; background: radial-gradient(circle at 50% 35%, #1c2758, #070b1f 70%); }
+  h1 { font-size: 54px; margin: 0; letter-spacing: .5px; }
+  .tag { font-size: 20px; max-width: 660px; line-height: 1.45; opacity: .9; margin: 0; }
+  .btns { display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; margin-top: 10px; }
+  button { font: inherit; font-size: 22px; padding: 16px 28px; border-radius: 16px; border: 0; cursor: pointer; background: #26346f; color: #fff; }
+  button.primary { background: #ffd60a; color: #14182e; font-weight: 700; }
+  button[hidden] { display: none; }
+  .note { font-size: 15px; opacity: .65; max-width: 580px; line-height: 1.5; margin: 6px 0 0; }
+  #status { color: #ffd60a; min-height: 20px; font-size: 15px; max-width: 580px; }
+  #deskhint { position: fixed; left: 12px; bottom: 10px; font-size: 13px; opacity: .7; display: none; z-index: 4; }
+</style>
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js" } }</script>
+</head>
+<body>
+<div id="landing">
+  <h1>Within Reach</h1>
+  <p class="tag">A seated, hands-only game that learns your reach, your hands and your steadiness in 90 seconds, then builds every challenge to fit you.</p>
+  <div class="btns">
+    <button id="mr" class="primary" hidden>Enter mixed reality</button>
+    <button id="vr" hidden>Enter VR</button>
+    <button id="desk">Try on desktop</button>
+  </div>
+  <p class="note">Sit comfortably and put your controllers down: you play with your bare hands, any finger works.
+    A session takes about 6 minutes. Everything runs on your headset; nothing is uploaded.</p>
+  <div id="status"></div>
+</div>
+<div id="deskhint">Desktop preview: click (or click and drag) to poke. Esc to leave.</div>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ================= renderer, scene, environment =================
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local');
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 60);
+function resetDesktopCamera() { camera.position.set(0, 0.04, 0.16); camera.lookAt(0, -0.17, -0.42); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+resetDesktopCamera();
+addEventListener('resize', () => { if (!renderer.xr.isPresenting) { renderer.setSize(innerWidth, innerHeight); resetDesktopCamera(); } });
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x2a3566, 2.0));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4); sun.position.set(0.4, 1, 0.6); scene.add(sun);
+
+// calm space for VR and desktop (hidden in mixed reality, where you see your own room)
+const env = new THREE.Group(); scene.add(env);
+{
+  env.add(new THREE.Mesh(new THREE.SphereGeometry(30, 32, 16), new THREE.ShaderMaterial({
+    side: THREE.BackSide, depthWrite: false,
+    uniforms: { top: { value: new THREE.Color('#1c2758') }, bottom: { value: new THREE.Color('#05070f') } },
+    vertexShader: 'varying vec3 vP; void main(){ vP = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+    fragmentShader: 'uniform vec3 top; uniform vec3 bottom; varying vec3 vP; void main(){ float h = clamp(vP.y * 0.8 + 0.5, 0.0, 1.0); gl_FragColor = vec4(mix(bottom, top, h), 1.0); }',
+  })));
+  const floor = new THREE.Mesh(new THREE.RingGeometry(0.6, 3.5, 64), new THREE.MeshBasicMaterial({ color: 0x2b3a7a, transparent: true, opacity: 0.25 }));
+  floor.rotation.x = -Math.PI / 2; floor.position.y = -1.2; env.add(floor);
+  const n = 300, pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) { const r = 3 + Math.random() * 10, a = Math.random() * Math.PI * 2; pos.set([Math.cos(a) * r, Math.random() * 6 - 2, Math.sin(a) * r], i * 3); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  env.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x9fb4ff, size: 0.03, transparent: true, opacity: 0.6 })));
+}
+
+// Everything in the game lives in `play`: origin = the player's head when the session starts, -Z = forward.
+const play = new THREE.Group(); scene.add(play);
+
+// ================= helpers =================
+const rand = (a, b) => a + Math.random() * (b - a);
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const V = (x, y, z) => new THREE.Vector3(x, y, z);
+const cm = m => Math.round(m * 100);
+const PALETTE = ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7']; // Okabe-Ito: color-blind safe
+const pickColor = () => PALETTE[Math.floor(Math.random() * PALETTE.length)];
+const ASSIST = ['off', 'bigger targets', 'bigger + slower'];
+const YC = -0.17; // play space center height relative to the head
+
+const SPH = new THREE.SphereGeometry(1, 32, 20);
+function orb(color, r) {
+  const m = new THREE.Mesh(SPH, new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.35, roughness: 0.25, metalness: 0.05, transparent: true, opacity: 0.94 }));
+  m.scale.setScalar(r); play.add(m); return m;
+}
+function dispose(obj) { if (!obj) return; play.remove(obj); obj.material.dispose(); }
+
+const numTex = {};
+function numSprite(n, r) {
+  if (!numTex[n]) {
+    const c = document.createElement('canvas'); c.width = c.height = 128; const g = c.getContext('2d');
+    g.font = '800 92px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.lineWidth = 12; g.strokeStyle = 'rgba(10,14,30,.85)'; g.strokeText(String(n), 64, 70); g.fillStyle = '#fff'; g.fillText(String(n), 64, 70);
+    numTex[n] = new THREE.CanvasTexture(c); numTex[n].colorSpace = THREE.SRGBColorSpace;
+  }
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: numTex[n], depthTest: false, transparent: true }));
+  s.renderOrder = 5; s.scale.setScalar(r * 1.4); play.add(s); return s;
+}
+
+// text panels drawn on canvases
+function label(w, h, px = 1024) {
+  const c = document.createElement('canvas'); c.width = px; c.height = Math.round(px * h / w);
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+  m.renderOrder = 10; m.visible = false; m.userData = { c, g: c.getContext('2d'), tex, key: '' }; play.add(m); return m;
+}
+function drawLabel(m, lines, { bg = 'rgba(8,12,30,.72)', color = '#fff', size = 56, align = 'center' } = {}) {
+  const key = JSON.stringify([lines, bg, color, size, align]);
+  if (m.userData.key === key) { m.visible = lines.length > 0; return; }
+  m.userData.key = key;
+  const { c, g, tex } = m.userData; g.clearRect(0, 0, c.width, c.height);
+  m.visible = lines.length > 0;
+  if (lines.length) {
+    if (bg) { g.fillStyle = bg; roundRect(g, 4, 4, c.width - 8, c.height - 8, 36); g.fill(); }
+    const L = lines.map(l => (typeof l === 'object' ? l : { t: l }));
+    const hs = L.map(l => (l.size || size) * 1.3), total = hs.reduce((a, b) => a + b, 0);
+    let y = c.height / 2 - total / 2;
+    g.textAlign = align; g.textBaseline = 'middle';
+    L.forEach((l, i) => {
+      g.font = `${l.bold ? 700 : 500} ${l.size || size}px system-ui, sans-serif`; g.fillStyle = l.color || color;
+      g.fillText(l.t, align === 'left' ? 44 : c.width / 2, y + hs[i] / 2); y += hs[i];
+    });
+  }
+  tex.needsUpdate = true;
+}
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+const subtitle = label(0.64, 0.085); subtitle.position.set(0, 0.11, -0.62);
+const toastL = label(0.64, 0.07); toastL.position.set(0, 0.2, -0.62);
+const panel = label(0.62, 0.27); panel.position.set(0, 0.03, -0.7);
+const fitPanel = label(0.32, 0.22, 768); fitPanel.position.set(-0.42, -0.02, -0.52);
+
+// ================= sound: synthesized, panned to where things are =================
+let AC = null;
+function tone(f, dur = 0.15, type = 'sine', vol = 0.2, slide = 0, delay = 0, pan = 0) {
+  if (!AC) return;
+  const t = AC.currentTime + delay, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t); if (slide) o.frequency.exponentialRampToValueAtTime(slide, t + dur);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g);
+  if (AC.createStereoPanner) { const p = AC.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); g.connect(p).connect(AC.destination); }
+  else g.connect(AC.destination);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+const panOf = pos => clamp(pos.x / 0.35, -1, 1);
+const sfx = {
+  pop: pos => tone(rand(520, 820), 0.12, 'sine', 0.28, 1500, 0, panOf(pos)),
+  boop: pos => tone(220, 0.22, 'sine', 0.16, 160, 0, panOf(pos)),
+  note: (f, pos) => tone(f, 0.35, 'triangle', 0.22, 0, 0, panOf(pos)),
+  yay: () => [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.2, 'triangle', 0.16, 0, i * 0.08)),
+  whoosh: () => tone(220, 0.45, 'sine', 0.07, 660),
+};
+
+// ================= voice + subtitles (every spoken line is also shown as text) =================
+const LINES = {
+  welcome: 'Poke the yellow orb to begin.',
+  pop: 'Pop the bubbles.',
+  order: 'Tap the numbers in order.',
+  echo: 'Watch, then repeat the pattern.',
+  both: 'Both hands, at the same time.',
+  reach: "I'm moving things to where you reach.",
+  assist: 'Making targets bigger and slower for you.',
+  one_hand: 'Bringing everything to your side.',
+  nice: 'Nice!',
+  paused: 'Paused. Raise a hand to keep playing.',
+  done: "That's the session. See you next time.",
+};
+const voiceBufs = {}; let voiceSrc = null;
+function loadVoice(id) {
+  if (!(id in voiceBufs)) voiceBufs[id] = fetch(`voice/${id}.mp3`).then(r => (r.ok ? r.arrayBuffer() : null))
+    .then(b => b && AC.decodeAudioData(b)).catch(() => null);
+  return voiceBufs[id];
+}
+async function say(id, { sub = true } = {}) {
+  const text = LINES[id];
+  if (sub) { drawLabel(subtitle, [text]); subUntil = performance.now() + 2800; }
+  const buf = AC ? await loadVoice(id) : null;
+  if (buf) {
+    try { voiceSrc && voiceSrc.stop(); } catch (e) {}
+    voiceSrc = AC.createBufferSource(); voiceSrc.buffer = buf; voiceSrc.connect(AC.destination); voiceSrc.start();
+  } else if (window.speechSynthesis) {
+    speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.rate = 0.95; speechSynthesis.speak(u);
+  }
+}
+function initAudio() {
+  if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+  AC.resume(); Object.keys(LINES).forEach(loadVoice);
+  if (window.speechSynthesis) speechSynthesis.speak(new SpeechSynthesisUtterance(''));
+}
+
+// ================= particles =================
+const PGEO = new THREE.IcosahedronGeometry(1, 0), particles = [];
+for (let i = 0; i < 160; i++) {
+  const m = new THREE.Mesh(PGEO, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true }));
+  m.visible = false; play.add(m); particles.push({ m, v: new THREE.Vector3(), life: 0 });
+}
+let pIdx = 0;
+function burst(pos, color, n = 16, speed = 0.6) {
+  for (let i = 0; i < n; i++) {
+    const p = particles[pIdx = (pIdx + 1) % particles.length];
+    p.m.position.copy(pos); p.v.set(rand(-1, 1), rand(-1, 1), rand(-1, 1)).normalize().multiplyScalar(speed * rand(0.4, 1));
+    p.m.material.color.set(color); p.life = 1; p.m.visible = true; p.m.scale.setScalar(rand(0.004, 0.009));
+  }
+}
+function stepParticles(dt) {
+  for (const p of particles) {
+    if (p.life <= 0) continue;
+    p.life -= dt * 1.6; p.m.position.addScaledVector(p.v, dt); p.v.multiplyScalar(0.9); p.v.y -= 0.4 * dt;
+    p.m.material.opacity = Math.max(0, p.life); if (p.life <= 0) p.m.visible = false;
+  }
+}
+
+// ================= toasts: the game tells you when it fits itself to you =================
+const toastQueue = [], lastNote = {};
+let toastUntil = 0, subUntil = 0;
+function toast(text) { toastQueue.push(text); }
+function noteChange(kind, text, voiceId) {
+  const now = performance.now(); if (now - (lastNote[kind] || 0) < 8000) return;
+  lastNote[kind] = now; toast(text); if (voiceId) say(voiceId, { sub: false });
+}
+
+// ================= FIT: learns this player's body =================
+// Reach envelope (meters from the head), learned with "probe" targets placed just past the edges:
+// reached probes grow that edge, missed probes shrink it. Plus which hands are used, and a steadiness assist.
+const ENV0 = { left: 0.26, right: 0.26, near: 0.24, far: 0.44, up: 0.14, down: 0.16 };
+const ENV_MAX = { left: 0.55, right: 0.55, far: 0.66, up: 0.3, down: 0.4 };
+const ENV_MIN = { left: 0.1, right: 0.1, far: 0.32, up: 0.04, down: 0.06 };
+const EDGE_TEXT = { left: 'on your left', right: 'on your right', far: 'in front', up: 'up high', down: 'down low' };
+const fit = {
+  env: { ...ENV0 }, pops: { left: 0, right: 0 }, oneHand: null, assist: 0, near: [], calmSince: 0,
+  hist: { left: [], right: [] }, jitter: { left: 0, right: 0 }, reachVoiced: false,
+  reset() { Object.assign(this, { env: { ...ENV0 }, pops: { left: 0, right: 0 }, oneHand: null, assist: 0, near: [], calmSince: 0, hist: { left: [], right: [] }, jitter: { left: 0, right: 0 }, reachVoiced: false }); },
+  assistR() { return [0, 0.012, 0.024][this.assist]; },
+  speedMul() { return [1, 0.7, 0.5][this.assist]; },
+  bounds() {
+    const e = this.env;
+    let xl = -e.left, xr = e.right;
+    if (this.oneHand === 'right') xl = -Math.min(e.left, 0.08);
+    if (this.oneHand === 'left') xr = Math.min(e.right, 0.08);
+    return { xl, xr, yl: YC - e.down, yh: YC + e.up, zn: e.near, zf: e.far };
+  },
+  spawn(probeChance = 0) {
+    const e = this.env, b = this.bounds();
+    const pos = V(rand(b.xl, b.xr), rand(b.yl, b.yh), -rand(b.zn, b.zf));
+    let probe = null;
+    if (Math.random() < probeChance) {
+      const edges = ['far', 'up', 'down'];
+      if (this.oneHand !== 'left') edges.push('right');
+      if (this.oneHand !== 'right') edges.push('left');
+      probe = edges[Math.floor(Math.random() * edges.length)];
+      if (probe === 'left') pos.x = -e.left * 1.12;
+      if (probe === 'right') pos.x = e.right * 1.12;
+      if (probe === 'far') pos.z = -e.far * 1.1;
+      if (probe === 'up') pos.y = YC + e.up * 1.12;
+      if (probe === 'down') pos.y = YC - e.down * 1.12;
+    }
+    return { pos, probe };
+  },
+  probeResult(edge, reached) {
+    const e = this.env, before = e[edge];
+    e[edge] = clamp(e[edge] * (reached ? 1.07 : 0.9), ENV_MIN[edge], ENV_MAX[edge]);
+    if (edge === 'far') e.far = Math.max(e.far, e.near + 0.08);
+    if (!reached && before - e[edge] > 0.004) {
+      noteChange('reach', `Fitting to you: closer ${EDGE_TEXT[edge]}`, this.reachVoiced ? null : 'reach'); this.reachVoiced = true;
+    }
+    if (reached && e[edge] - before > 0.004) noteChange('reachup', `Fitting to you: more reach ${EDGE_TEXT[edge]}`);
+  },
+  popBy(side) {
+    if (side !== 'left' && side !== 'right') return;
+    this.pops[side]++;
+    const other = side === 'left' ? 'right' : 'left';
+    if (!this.oneHand && this.pops[side] >= 8 && this.pops[other] === 0) {
+      this.oneHand = side; noteChange('hand', `One-hand mode: everything comes to your ${side}`, 'one_hand');
+    } else if (this.oneHand && this.oneHand !== side && this.pops[side] >= 2) {
+      this.oneHand = null; noteChange('hand', 'Both hands spotted: using your full reach');
+    }
+  },
+  nearMiss(t) { this.near.push(t); this.updateAssist(t); },
+  // steadiness: wobble of the fingertip around its own path while it slowly closes in on a target
+  trackJitter(side, p, nearTarget, t) {
+    const h = this.hist[side]; if (!h) return;
+    h.push({ t, p: p.clone() }); while (h.length && t - h[0].t > 300) h.shift();
+    if (!nearTarget || h.length < 8) return;
+    const a = h[0], b = h[h.length - 1], span = b.t - a.t; if (span < 150) return;
+    if (a.p.distanceTo(b.p) / (span / 1000) > 0.12) return; // moving on purpose, not wobbling
+    let ss = 0; const q = new THREE.Vector3();
+    for (const s of h) { q.lerpVectors(a.p, b.p, (s.t - a.t) / span); ss += s.p.distanceToSquared(q); }
+    const rmsMM = Math.sqrt(ss / h.length) * 1000;
+    this.jitter[side] = this.jitter[side] * 0.98 + rmsMM * 0.02;
+  },
+  updateAssist(t) {
+    this.near = this.near.filter(x => t - x < 40000);
+    const nm = this.near.length, j = Math.max(this.jitter.left, this.jitter.right);
+    const want = Math.max(nm >= 6 ? 2 : nm >= 3 ? 1 : 0, j > 4 ? 2 : j > 2.5 ? 1 : 0);
+    if (want >= this.assist) {
+      if (want > this.assist) { this.assist = want; noteChange('assist', `Steady assist: ${ASSIST[want]}`, 'assist'); }
+      this.calmSince = t;
+    } else if (t - this.calmSince > 60000) {
+      this.assist--; this.calmSince = t; noteChange('assist', this.assist ? 'Assist eased a little' : "Assist off: you've got this");
+    }
+  },
+};
+function handsText() {
+  if (fit.oneHand) return `${fit.oneHand} only`;
+  if (fit.pops.left && fit.pops.right) return 'both';
+  return fit.pops.left || fit.pops.right ? 'one so far' : 'learning';
+}
+
+// ================= BRAIN: skill level from performance (same engine as Play Wall) =================
+const brain = {
+  skill: 1, best: 1, trials: [], warmupUntil: 0, lastActive: 0,
+  reset(skill, t, warm) { Object.assign(this, { skill, best: skill, trials: [], warmupUntil: t + warm, lastActive: t }); },
+  record(ok, secs, t) {
+    this.trials.push({ ok, secs }); if (this.trials.length > 8) this.trials.shift();
+    const warm = t < this.warmupUntil, n = this.trials.length; if (n < (warm ? 3 : 5)) return;
+    const wins = this.trials.filter(x => x.ok), rate = wins.length / n;
+    const avg = wins.length ? wins.reduce((a, x) => a + x.secs, 0) / wins.length : 99;
+    // a game can only prove skill up to its own ceiling, so players step through the game types
+    const cap = director.game ? director.game.cap : 10;
+    if (rate >= 0.8 && avg < 4) { this.skill = Math.max(this.skill, Math.min(cap, this.skill + (warm ? 1.5 : 0.5))); this.trials = []; }
+    else if (rate <= 0.4) { this.skill = Math.max(0, this.skill - (warm ? 1 : 0.6)); this.trials = []; }
+    this.best = Math.max(this.best, this.skill);
+  },
+};
+
+// ================= GAMES =================
+// Each: start(t), update(dt,t), targets(), poke(target, poker, t), end(). Targets: { pos, r, wasInside }.
+
+// Pop (level 0-3.5): bubbles drift inside your reach. This is also where reach is measured (probe bubbles).
+const Pop = {
+  name: 'Pop', voice: 'pop', cap: 4.2, list: [],
+  k() { return clamp(brain.skill / 3.5, 0, 1); },
+  start(t) { this.end(); this.lastPop = t; this.lastSpawn = t; for (let i = 0; i < 3; i++) this.spawn(t); },
+  spawn(t) {
+    const k = this.k(), { pos, probe } = fit.spawn(t < brain.warmupUntil ? 0.3 : 0.15);
+    const r = lerp(0.055, 0.036, k) + fit.assistR() * 0.5, color = pickColor(), mesh = orb(color, r);
+    mesh.position.copy(pos);
+    const vel = V(rand(-1, 1), rand(-0.5, 0.5), rand(-0.3, 0.3)).normalize().multiplyScalar(lerp(0.004, 0.03, k) * fit.speedMul());
+    this.list.push({ pos: mesh.position, r, mesh, color, probe, born: t, vel, life: lerp(9000, 6000, k) / fit.speedMul(), ph: rand(0, 6), wasInside: false });
+  },
+  update(dt, t) {
+    const n = Math.round(lerp(3, 7, this.k())), e = fit.env;
+    if (this.list.length < n && t - this.lastSpawn > 600) { this.spawn(t); this.lastSpawn = t; }
+    for (const b of this.list) {
+      b.ph += dt; b.pos.addScaledVector(b.vel, dt);
+      if (b.pos.x < -e.left * 1.15) b.vel.x = Math.abs(b.vel.x); if (b.pos.x > e.right * 1.15) b.vel.x = -Math.abs(b.vel.x);
+      if (b.pos.y < YC - e.down * 1.15) b.vel.y = Math.abs(b.vel.y); if (b.pos.y > YC + e.up * 1.15) b.vel.y = -Math.abs(b.vel.y);
+      if (-b.pos.z < e.near * 0.9) b.vel.z = -Math.abs(b.vel.z); if (-b.pos.z > e.far * 1.12) b.vel.z = Math.abs(b.vel.z);
+      b.mesh.scale.setScalar(b.r * Math.min(1, (t - b.born) / 300) * (1 + Math.sin(b.ph * 3) * 0.03));
+      if (t - b.born > b.life) { b.dead = true; if (b.probe) fit.probeResult(b.probe, false); }
+    }
+    this.list = this.list.filter(b => { if (b.dead) dispose(b.mesh); return !b.dead; });
+    if (t - this.lastPop > 8000) { brain.record(false, 8, t); this.lastPop = t; }
+  },
+  targets() { return this.list; },
+  poke(b, pk, t) {
+    this.list.splice(this.list.indexOf(b), 1); dispose(b.mesh);
+    burst(b.pos, b.color, 18); sfx.pop(b.pos); fit.popBy(pk.side);
+    if (b.probe) fit.probeResult(b.probe, true);
+    brain.record(true, (t - this.lastPop) / 1000, t); this.lastPop = t;
+  },
+  end() { this.list.forEach(b => dispose(b.mesh)); this.list = []; },
+};
+
+// Order (level 3.5-6.5): numbered orbs, tap 1 to N. 3 -> 8 orbs.
+const Order = {
+  name: 'Order', voice: 'order', cap: 7.2, items: [],
+  start(t) { this.round(t); },
+  round(t) {
+    this.end();
+    const k = clamp((brain.skill - 3.5) / 3, 0, 1), n = Math.round(lerp(3, 8, k)), r = lerp(0.05, 0.036, k) + fit.assistR() * 0.5;
+    for (let tries = 0; this.items.length < n && tries < 400; tries++) {
+      const { pos } = fit.spawn(0);
+      if (this.items.every(o => o.base.distanceTo(pos) > r * 2.8)) {
+        const color = PALETTE[this.items.length % PALETTE.length], mesh = orb(color, r), num = numSprite(this.items.length + 1, r);
+        mesh.position.copy(pos); num.position.copy(pos);
+        this.items.push({ pos: mesh.position, base: pos.clone(), r, mesh, num, n: this.items.length + 1, color, done: false, shake: 0, wasInside: false });
+      }
+    }
+    this.next = 1; this.started = t; this.wrong = 0; this.doneAt = 0;
+  },
+  update(dt, t) {
+    for (const o of this.items) {
+      o.shake = Math.max(0, o.shake - dt * 3);
+      o.pos.copy(o.base); if (o.shake) o.pos.x += Math.sin(t / 25) * o.shake * 0.01;
+      o.num.position.copy(o.pos); o.mesh.scale.setScalar(o.r * (o.done ? 0.55 : 1));
+    }
+    if (this.doneAt) { if (t - this.doneAt > 1200) this.round(t); return; }
+    if (t - this.started > this.items.length * 6000) { brain.record(false, 6, t); this.round(t); }
+  },
+  targets() { return this.doneAt ? [] : this.items.filter(o => !o.done); },
+  poke(o, pk, t) {
+    if (o.n !== this.next) { this.wrong++; o.shake = 1; sfx.boop(o.pos); return; }
+    o.done = true; o.mesh.material.opacity = 0.35; o.mesh.material.emissiveIntensity = 0.1;
+    burst(o.pos, o.color, 12, 0.4); sfx.note(392 * Math.pow(2, (o.n - 1) * 2 / 12), o.pos); fit.popBy(pk.side); this.next++;
+    if (this.next > this.items.length) {
+      this.doneAt = t; const per = (t - this.started) / 1000 / this.items.length;
+      brain.record(this.wrong <= 1 && per < 2.5, per, t); sfx.yay(); if (Math.random() < 0.4) say('nice');
+    }
+  },
+  end() { this.items.forEach(o => { dispose(o.mesh); dispose(o.num); }); this.items = []; },
+};
+
+// Echo (level 6.5-8.5): four orbs, each with its own note. Watch the pattern, repeat it. 2 -> 6 steps.
+const Echo = {
+  name: 'Echo', voice: 'echo', cap: 9.2, items: [], NOTES: [392, 494, 587, 740], COLS: [0, 1, 2, 6],
+  start(t) {
+    this.end();
+    const b = fit.bounds(), r = 0.05 + fit.assistR() * 0.5, z = -(b.zn + b.zf) / 2;
+    const xl = Math.max(b.xl, -0.3), xr = Math.min(b.xr, 0.3);
+    const row = xr - xl >= 3 * 2.6 * r;
+    for (let i = 0; i < 4; i++) {
+      const pos = row ? V(lerp(xl, xr, i / 3), YC + 0.02, z - Math.cos((i / 3 - 0.5) * 2) * 0.03)
+                      : V((xl + xr) / 2 + (i % 2 ? 1 : -1) * 1.3 * r, YC + (i < 2 ? 1.3 * r : -1.3 * r), z);
+      const color = PALETTE[this.COLS[i]], mesh = orb(color, r); mesh.position.copy(pos);
+      this.items.push({ pos: mesh.position, r, mesh, i, color, glow: 0, wasInside: false });
+    }
+    this.newSeq(t);
+  },
+  len() { return Math.round(lerp(2, 6, clamp((brain.skill - 6.5) / 2, 0, 1))); },
+  newSeq(t) {
+    this.seq = Array.from({ length: this.len() }, () => Math.floor(Math.random() * 4));
+    this.phase = 'show'; this.showAt = t + 900; this.showIdx = 0; this.input = 0; this.wrong = 0;
+  },
+  update(dt, t) {
+    for (const o of this.items) {
+      o.glow = Math.max(0, o.glow - dt * 2.5);
+      o.mesh.material.emissiveIntensity = 0.25 + o.glow * 1.2; o.mesh.scale.setScalar(o.r * (1 + o.glow * 0.18));
+    }
+    if (this.phase === 'show' && t >= this.showAt) {
+      if (this.showIdx < this.seq.length) {
+        const o = this.items[this.seq[this.showIdx++]]; o.glow = 1; sfx.note(this.NOTES[o.i], o.pos);
+        this.showAt = t + lerp(750, 480, clamp((brain.skill - 6.5) / 2, 0, 1)) / fit.speedMul();
+      } else { this.phase = 'input'; this.inputStart = t; this.lastInput = t; }
+    }
+    if (this.phase === 'input' && t - this.lastInput > 8000) { brain.record(false, 8, t); this.newSeq(t); }
+    if (this.phase === 'done' && t > this.nextAt) this.newSeq(t);
+  },
+  targets() { return this.phase === 'input' ? this.items : []; },
+  poke(o, pk, t) {
+    fit.popBy(pk.side); this.lastInput = t;
+    if (o.i === this.seq[this.input]) {
+      o.glow = 1; sfx.note(this.NOTES[o.i], o.pos);
+      if (++this.input === this.seq.length) {
+        this.phase = 'done'; this.nextAt = t + 1200; sfx.yay(); burst(o.pos, o.color, 14, 0.4);
+        brain.record(this.wrong === 0, (t - this.inputStart) / 1000 / this.seq.length, t);
+      }
+    } else {
+      this.wrong++; sfx.boop(o.pos); o.glow = 0.4;
+      if (this.wrong >= 3) { brain.record(false, 8, t); this.newSeq(t); return; }
+      this.phase = 'show'; this.showIdx = 0; this.input = 0; this.showAt = t + 900; // replay the same pattern
+    }
+  },
+  end() { this.items.forEach(o => dispose(o.mesh)); this.items = []; },
+};
+
+// Both hands (level 8.5+, only once both hands have been used): pop a left and a right orb within 0.7s.
+const Both = {
+  name: 'Both hands', voice: 'both', cap: 10, items: [],
+  start(t) { this.fails = 0; this.round(t); },
+  round(t) {
+    this.end();
+    const e = fit.env, w = Math.min(e.left, e.right), r = 0.048 + fit.assistR() * 0.5;
+    const x = rand(0.4, 0.9) * w, y = YC + rand(-e.down, e.up) * 0.7, z = -rand(e.near, e.far);
+    this.items = [-1, 1].map(s => {
+      const color = s < 0 ? PALETTE[1] : PALETTE[0], mesh = orb(color, r); mesh.position.set(s * x, y, z);
+      return { pos: mesh.position, r, mesh, color, popped: 0, wasInside: false };
+    });
+    this.started = t; this.doneAt = 0;
+  },
+  update(dt, t) {
+    for (const o of this.items) o.mesh.visible = !o.popped;
+    if (this.doneAt) { if (t - this.doneAt > 900) this.round(t); return; }
+    const popped = this.items.filter(o => o.popped);
+    if (popped.length === 1 && t - popped[0].popped > 700) {
+      popped[0].popped = 0; sfx.boop(popped[0].pos); if (++this.fails % 3 === 0) brain.record(false, 3, t);
+    }
+    if (t - this.started > 9000) { brain.record(false, 9, t); this.round(t); }
+  },
+  targets() { return this.doneAt ? [] : this.items.filter(o => !o.popped); },
+  poke(o, pk, t) {
+    o.popped = Math.max(t, 1); burst(o.pos, o.color, 14); sfx.pop(o.pos); fit.popBy(pk.side);
+    if (this.items.every(x => x.popped)) { this.doneAt = t; brain.record(true, (t - this.started) / 1000, t); sfx.yay(); }
+  },
+  end() { this.items.forEach(o => dispose(o.mesh)); this.items = []; },
+};
+
+const GAMES = [Pop, Order, Echo, Both];
+function bandGame() {
+  const s = brain.skill;
+  if (s < 3.5) return Pop;
+  if (s < 6.5) return Order;
+  if (s < 8.5 || fit.oneHand || !(fit.pops.left && fit.pops.right)) return Echo;
+  return Both;
+}
+
+// ================= DIRECTOR: picks the game type from the level =================
+const director = {
+  game: null, since: 0, holdUntil: 0, popCalibrated: false,
+  set(g, t, hold = 0) {
+    if (this.game === Pop && g !== Pop) this.popCalibrated = true;
+    if (this.game) this.game.end();
+    this.game = g; this.since = t; this.holdUntil = t + hold; g.start(t); sfx.whoosh(); say(g.voice);
+  },
+  tick(t) {
+    const want = bandGame(), warm = t < brain.warmupUntil;
+    const minDwell = this.game === Pop && !this.popCalibrated ? 25000 : warm ? 5000 : 9000; // first Pop round = reach fitting
+    if (want !== this.game && t > this.holdUntil && t - this.since > minDwell) return this.set(want, t);
+    if (t - this.since > 100000) { // variety: sometimes an easier breather for 30s
+      const i = GAMES.indexOf(want);
+      return i > 0 && Math.random() < 0.35 ? this.set(GAMES[i - 1], t, 30000) : this.set(want, t);
+    }
+    if (t - brain.lastActive > 15000 && t - this.since > 15000) { // nothing poked for a while: ease off
+      brain.skill = Math.max(0, brain.skill - 0.5); brain.lastActive = t;
+      this.set(GAMES[Math.max(0, GAMES.indexOf(this.game) - 1)], t, 15000);
+    }
+  },
+};
+
+// ================= MENU: start and end screens, also played by poking =================
+const Menu = {
+  items: [],
+  show(kind) {
+    this.clear();
+    const go = orb('#ffd60a', 0.055); go.position.set(0, YC, -0.36);
+    this.items.push({ pos: go.position, r: 0.055, mesh: go, act: 'play', ph: 0, wasInside: false });
+    if (kind === 'start' && saved) {
+      const nw = orb('#56B4E9', 0.03); nw.position.set(0.17, YC - 0.06, -0.34);
+      this.items.push({ pos: nw.position, r: 0.03, mesh: nw, act: 'reset', ph: 1, wasInside: false });
+    }
+    const e = fit.env;
+    drawLabel(panel, kind === 'start'
+      ? [{ t: 'Within Reach', bold: true, size: 92 }, 'Poke the yellow orb with any finger to begin.',
+         saved ? 'Welcome back: your fit is saved. Blue orb = new player.' : 'It learns how you reach and play in about 90 seconds.']
+      : [{ t: 'Session complete', bold: true, size: 80 }, `Level ${brain.skill.toFixed(1)} of 10  ·  best ${Math.max(brain.best, brain.skill).toFixed(1)}`,
+         `Your reach: left ${cm(e.left)} · right ${cm(e.right)} · out ${cm(e.far)} cm`,
+         `Hands: ${handsText()}  ·  Assist: ${ASSIST[fit.assist]}`, { t: 'Poke the orb to play again', color: '#ffd60a' }],
+      { size: 48 });
+  },
+  update(dt) { for (const it of this.items) { it.ph += dt; it.mesh.scale.setScalar(it.r * (1 + Math.sin(it.ph * 3) * 0.06)); } },
+  targets() { return this.items; },
+  poke(it) {
+    burst(it.pos, it.act === 'play' ? '#ffd60a' : '#56B4E9', 20); sfx.yay();
+    if (it.act === 'play') startSession();
+    else { clearProfile(); fit.reset(); this.show('start'); toast('New player: starting fresh'); }
+  },
+  clear() { this.items.forEach(i => dispose(i.mesh)); this.items = []; },
+};
+
+// ================= saved fit (on this headset only) =================
+const KEY = 'withinreach.profile.v1';
+let saved = null;
+try { saved = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) {}
+function saveProfile(sessions) {
+  saved = { skill: brain.skill, env: { ...fit.env }, assist: fit.assist, oneHand: fit.oneHand, sessions: sessions ?? (saved?.sessions || 0) };
+  try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) {}
+}
+function clearProfile() { saved = null; try { localStorage.removeItem(KEY); } catch (e) {} }
+
+// ================= INPUT: every fingertip is a poker (hands first; controllers and mouse also work) =================
+const hands = [0, 1].map(i => renderer.xr.getHand(i)), grips = [0, 1].map(i => renderer.xr.getControllerGrip(i));
+hands.forEach((h, i) => {
+  scene.add(h); scene.add(grips[i]);
+  for (const o of [h, grips[i]]) {
+    o.addEventListener('connected', e => { o.userData.connected = true; o.userData.isHand = !!e.data.hand; o.userData.side = e.data.handedness; });
+    o.addEventListener('disconnected', () => { o.userData.connected = false; o.userData.isHand = false; });
+  }
+});
+const FINGERS = ['index-finger-tip', 'middle-finger-tip', 'ring-finger-tip', 'pinky-finger-tip', 'thumb-tip'];
+const pokers = [], mouse = { down: false, x: 0, y: 0 }, raycaster = new THREE.Raycaster(), _w = new THREE.Vector3();
+function readPokers() {
+  pokers.length = 0;
+  if (renderer.xr.isPresenting) {
+    if (!anchored) return;
+    for (let i = 0; i < 2; i++) {
+      const h = hands[i], g = grips[i];
+      if (h.userData.isHand) {
+        for (const f of FINGERS) {
+          const j = h.joints[f];
+          if (j && j.visible) pokers.push({ p: play.worldToLocal(_w.copy(j.position)).clone(), side: h.userData.side, main: f === 'index-finger-tip' });
+        }
+      } else if (g.userData.connected) {
+        const tip = V(0, 0, -0.06).applyQuaternion(g.quaternion).add(g.position);
+        pokers.push({ p: play.worldToLocal(tip).clone(), side: g.userData.side, main: true });
+      }
+    }
+  } else if (mouse.down && state !== 'landing') {
+    raycaster.setFromCamera(new THREE.Vector2(mouse.x, mouse.y), camera);
+    const ray = raycaster.ray, game = state === 'play' ? director.game : state === 'start' || state === 'end' ? Menu : null;
+    let p = null;
+    for (const tg of game ? game.targets() : []) {
+      const c = ray.closestPointToPoint(tg.pos, new THREE.Vector3());
+      if (c.distanceTo(tg.pos) < tg.r && (!p || c.distanceTo(ray.origin) < p.distanceTo(ray.origin))) p = c;
+    }
+    if (!p) p = ray.at((-0.4 - ray.origin.z) / ray.direction.z, new THREE.Vector3());
+    pokers.push({ p, side: 'mouse', main: false });
+  }
+}
+function setMouse(e) { mouse.x = (e.clientX / innerWidth) * 2 - 1; mouse.y = -(e.clientY / innerHeight) * 2 + 1; }
+renderer.domElement.addEventListener('pointerdown', e => { if (!renderer.xr.isPresenting) { setMouse(e); mouse.down = true; } });
+renderer.domElement.addEventListener('pointermove', setMouse);
+addEventListener('pointerup', () => { mouse.down = false; });
+
+// fingertip dots so you can see what's poking
+const DOT = new THREE.SphereGeometry(1, 12, 8), dots = [];
+for (let i = 0; i < 12; i++) {
+  const m = new THREE.Mesh(DOT, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55, depthWrite: false }));
+  m.visible = false; play.add(m); dots.push(m);
+}
+function updateDots() { dots.forEach((d, i) => { const pk = pokers[i]; d.visible = !!pk; if (pk) { d.position.copy(pk.p); d.scale.setScalar(pk.main ? 0.008 : 0.005); } }); }
+
+// collision: a target is poked when any fingertip enters it (forgiving margin, plus the steadiness assist)
+function processPokes(game, t) {
+  const aR = fit.assistR(), trackNear = game === Pop || game === Both;
+  for (const pk of pokers) pk.minD = Infinity;
+  for (const tg of game.targets().slice()) {
+    let inside = false, by = null, minD = Infinity;
+    for (const pk of pokers) {
+      const d = pk.p.distanceTo(tg.pos) - tg.r;
+      if (d < pk.minD) pk.minD = d; if (d < minD) minD = d;
+      if (d < (tg.wasInside ? 0.02 : 0.008) + aR) { inside = true; by = by || pk; }
+    }
+    if (inside && !tg.wasInside) { tg.wasInside = true; brain.lastActive = t; game.poke(tg, by, t); continue; }
+    tg.wasInside = inside;
+    if (trackNear) { // near miss: a fingertip hovering just outside a target without touching it
+      if (minD > 0.008 + aR && minD < 0.035 + aR) { tg.nearT = tg.nearT || t; if (!tg.nearCounted && t - tg.nearT > 400) { tg.nearCounted = true; fit.nearMiss(t); } }
+      else if (minD > 0.06) { tg.nearT = 0; tg.nearCounted = false; }
+    }
+  }
+}
+
+// ================= SESSION FLOW =================
+const SESSION_MS = 6 * 60000;
+let state = 'landing', gt = 0, sessionEndAt = 0, anchored = true, xrFrames = 0, lastFitTick = 0;
+let lastSeen = 0, seenSince = 0, sysHidden = false, lastSave = 0, lastFitDraw = 0, xrSession = null;
+const _h = new THREE.Vector3(), _d = new THREE.Vector3();
+
+function anchorNow() { // put the play space in front of wherever the player is looking right now
+  const cam = renderer.xr.getCamera(); cam.getWorldPosition(_h); cam.getWorldDirection(_d);
+  play.position.copy(_h); play.rotation.set(0, Math.atan2(-_d.x, -_d.z), 0); play.updateMatrixWorld(true);
+  play.visible = true; anchored = true;
+}
+function startSession() {
+  Menu.clear(); drawLabel(panel, []);
+  if (renderer.xr.isPresenting) anchorNow();
+  gt = 0; lastFitTick = 0; fit.reset(); director.popCalibrated = false;
+  if (saved) {
+    Object.assign(fit.env, saved.env); fit.assist = saved.assist || 0; fit.oneHand = saved.oneHand || null;
+    brain.reset(Math.max(0, saved.skill - 1), 0, 45000); director.popCalibrated = true;
+    toast('Welcome back: fitted from last time');
+  } else brain.reset(1, 0, 90000);
+  sessionEndAt = SESSION_MS; state = 'play'; director.game = null; director.set(bandGame(), 0);
+}
+function endSession() {
+  director.game.end(); director.game = null;
+  saveProfile((saved?.sessions || 0) + 1);
+  drawLabel(subtitle, []); subUntil = 0; toastQueue.length = 0;
+  state = 'end'; Menu.show('end'); say('done', { sub: false });
+}
+function toLanding() {
+  if (director.game) { director.game.end(); director.game = null; }
+  Menu.clear(); drawLabel(panel, []); drawLabel(subtitle, []); drawLabel(toastL, []); toastQueue.length = 0;
+  state = 'landing'; landing.style.display = 'flex'; deskhint.style.display = 'none';
+  play.position.set(0, 0, 0); play.rotation.set(0, 0, 0); play.visible = true; env.visible = true; anchored = true;
+  renderer.setSize(innerWidth, innerHeight); resetDesktopCamera();
+}
+
+function update(dt, now) {
+  if (state === 'start' || state === 'end') { processPokes(Menu, now); Menu.update(dt); return; }
+  if (state === 'paused') {
+    if (!sysHidden && pokers.length && now - seenSince > 600) { state = 'play'; subUntil = 0; }
+    return;
+  }
+  if (state !== 'play') return;
+  if (renderer.xr.isPresenting && (sysHidden || now - lastSeen > 4000)) { // hands down or headset menu open: pause cleanly
+    state = 'paused'; say('paused'); subUntil = Infinity; return;
+  }
+  gt += dt * 1000;
+  director.tick(gt);
+  processPokes(director.game, gt);
+  for (const pk of pokers) if (pk.main) fit.trackJitter(pk.side, pk.p, pk.minD < 0.08, gt);
+  director.game.update(dt, gt);
+  if (gt - lastFitTick > 1000) { fit.updateAssist(gt); lastFitTick = gt; }
+  if (now - lastSave > 30000) { saveProfile(); lastSave = now; }
+  if (gt > sessionEndAt) endSession();
+}
+
+function drawFit() {
+  const e = fit.env;
+  drawLabel(fitPanel, [
+    { t: 'Fitted to you', bold: true, size: 44, color: '#ffd60a' },
+    `Level ${brain.skill.toFixed(1)} · ${director.game ? director.game.name : '-'}`,
+    `Reach  L ${cm(e.left)} · R ${cm(e.right)} · out ${cm(e.far)} cm`,
+    `Hands  ${handsText()}`,
+    `Assist  ${ASSIST[fit.assist]}`,
+    { t: gt < brain.warmupUntil ? 'Learning how you play…' : `${Math.max(0, Math.ceil((sessionEndAt - gt) / 60000))} min left`, color: '#9fb4ff' },
+  ], { size: 38, align: 'left' });
+}
+function updateUI(now) {
+  (renderer.xr.isPresenting ? renderer.xr.getCamera() : camera).getWorldPosition(_h);
+  for (const l of [subtitle, toastL, panel, fitPanel]) l.lookAt(_h);
+  if (now > subUntil && subtitle.visible) drawLabel(subtitle, []);
+  if (now > toastUntil) {
+    if (toastQueue.length) { drawLabel(toastL, [{ t: toastQueue.shift(), color: '#ffd60a' }], { size: 50, bg: 'rgba(8,12,30,.6)' }); toastUntil = now + 3200; }
+    else if (toastL.visible) drawLabel(toastL, []);
+  }
+  const showFit = state === 'play' || state === 'paused';
+  if (showFit && now - lastFitDraw > 500) { drawFit(); lastFitDraw = now; }
+  fitPanel.visible = showFit;
+}
+
+// ================= main loop =================
+let lastT = 0;
+renderer.setAnimationLoop(time => {
+  const now = performance.now(), dt = lastT ? Math.min(0.05, (time - lastT) / 1000) : 0; lastT = time;
+  if (renderer.xr.isPresenting && !anchored && ++xrFrames > 10) anchorNow();
+  readPokers();
+  if (pokers.length) { if (now - lastSeen > 500) seenSince = now; lastSeen = now; }
+  update(dt, now);
+  stepParticles(dt); updateDots(); updateUI(now);
+  renderer.render(scene, camera);
+});
+
+// ================= landing page =================
+const landing = document.getElementById('landing'), deskhint = document.getElementById('deskhint'), status = document.getElementById('status');
+const mrBtn = document.getElementById('mr'), vrBtn = document.getElementById('vr');
+if (navigator.xr) {
+  navigator.xr.isSessionSupported('immersive-ar').then(ok => { mrBtn.hidden = !ok; }).catch(() => {});
+  navigator.xr.isSessionSupported('immersive-vr').then(ok => { vrBtn.hidden = !ok; if (ok && mrBtn.hidden) vrBtn.classList.add('primary'); }).catch(() => {});
+} else status.textContent = 'Open this page in the Meta Quest browser to play in VR. You can try the desktop preview here.';
+
+async function enterXR(kind) {
+  initAudio(); status.textContent = '';
+  try {
+    xrSession = await navigator.xr.requestSession(kind, { optionalFeatures: ['hand-tracking'] });
+    renderer.xr.setReferenceSpaceType('local');
+    await renderer.xr.setSession(xrSession);
+    env.visible = kind === 'immersive-vr';
+    sysHidden = false;
+    xrSession.addEventListener('visibilitychange', () => { sysHidden = xrSession.visibilityState !== 'visible'; });
+    xrSession.addEventListener('end', () => { if (state === 'play' || state === 'paused') saveProfile(); xrSession = null; toLanding(); });
+    landing.style.display = 'none'; anchored = false; xrFrames = 0; play.visible = false;
+    state = 'start'; Menu.show('start'); say('welcome', { sub: false });
+  } catch (e) { status.textContent = `Couldn't start ${kind === 'immersive-ar' ? 'mixed reality' : 'VR'}: ${e.message}`; }
+}
+mrBtn.addEventListener('click', () => enterXR('immersive-ar'));
+vrBtn.addEventListener('click', () => enterXR('immersive-vr'));
+document.getElementById('desk').addEventListener('click', () => {
+  initAudio(); landing.style.display = 'none'; deskhint.style.display = 'block';
+  env.visible = true; state = 'start'; Menu.show('start'); say('welcome', { sub: false });
+});
+addEventListener('keydown', e => { if (e.key === 'Escape' && !renderer.xr.isPresenting && state !== 'landing') { if (state === 'play' || state === 'paused') saveProfile(); toLanding(); } });
+
+// for poking at it from the browser console
+window.wr = { brain, fit, director, Menu, camera, play, get state() { return state; }, get gt() { return gt; }, skipToEnd() { sessionEndAt = gt; } };
+</script>
+</body>
+</html>
